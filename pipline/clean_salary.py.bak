@@ -1,0 +1,196 @@
+"""Chuẩn hóa lương về VND/tháng, giữ nguyên các trường dữ liệu gốc.
+
+Chạy từ thư mục gốc: python -m pipline.clean_salary
+Mặc định: data/full.jsonl -> data/salary.jsonl (ghi lại, không ghi nối).
+
+Quy ước cho báo cáo:
+- USD_TO_VND = 25.000 là tỷ giá cố định của bài tập, không phải tỷ giá thị trường.
+- Lương năm chia 12; chỉ đổi khi biết tiền tệ và kỳ trả (từ chuỗi hoặc JSON-LD).
+- Thiếu kỳ trả, kể cả "15 - 20 triệu", giữ unknown, không tự đoán theo tháng.
+- Thương lượng/không công bố/ẩn đăng nhập dùng null, không thay bằng 0.
+- "closed_range" gồm cả lương cố định (min = max); cận mở còn lại là null.
+"""
+
+import argparse
+import math
+import re
+import sys
+import tempfile
+import unicodedata
+from collections import Counter
+from pathlib import Path
+
+from crawler.base import read_jsonl, write_jsonl
+
+
+USD_TO_VND = 25_000
+SALARY_COLUMNS = (
+    "Luong_Min", "Luong_Max", "salary_status",
+    "salary_currency_orig", "salary_period_orig",
+)
+HIDDEN = {"sign in to view salary", "login to view salary", "log in to view salary"}
+NEGOTIABLE = {"thoa thuan", "thuong luong", "negotiable", "you'll love it"}
+
+# Phân biệt số thập phân (20.7) với dấu ngăn hàng nghìn (1,000 / 10.000.000).
+NUMBER = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,3}(?:\.[0-9]{3})+|[0-9]+(?:\.[0-9]+)?)"
+CURRENCY = r"(?:usd|\$|vnd|₫|d)"
+AMOUNTS = [
+    rf"(?P<before{i}>{CURRENCY})?\s*(?P<number{i}>{NUMBER})\s*"
+    rf"(?P<scale{i}>trieu|tr|m)?\s*(?P<after{i}>{CURRENCY})?"
+    for i in (1, 2)
+]
+SALARY_RE = re.compile(
+    r"(?P<prefix>up\s+to|from|tu|toi|den|under|below|over|above|tren)?\s*"
+    + AMOUNTS[0]
+    + rf"(?:\s*-\s*{AMOUNTS[1]})?"
+    + r"(?:\s*/\s*(?P<period>thang|month|nam|year))?"
+)
+
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text.casefold().replace("đ", "d"))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return " ".join(text.replace("’", "'").split())
+
+
+def parse_salary(raw, *, currency_hint=None, period_hint=None) -> dict:
+    """Đọc trọn chuỗi bằng regex; hint chỉ bổ sung thông tin JSON-LD còn thiếu."""
+    result = dict.fromkeys(SALARY_COLUMNS)
+    result["salary_status"] = "unknown"
+    if raw is None:
+        return result
+    text = normalize(str(raw))
+    if text in NEGOTIABLE:
+        result["salary_status"] = "negotiable"
+        return result
+    if text in HIDDEN:
+        result["salary_status"] = "hidden"
+        return result
+    text = re.sub(r"[–—−]", "-", text)
+    match = SALARY_RE.fullmatch(text)
+    if not match:
+        return result
+    groups = match.groupdict()
+
+    tokens = [groups[key] for key in ("before1", "after1", "before2", "after2") if groups[key]]
+    currencies = {"USD" if token in ("usd", "$") else "VND" for token in tokens}
+    has_scale = bool(groups["scale1"] or groups["scale2"])
+    if has_scale:
+        # VietnamWorks có "$ 30tr-50tr": tr/triệu vẫn là VND, bỏ ký hiệu $ sai.
+        if "usd" in tokens:
+            return result
+        currencies = {"VND"}
+    if len(currencies) > 1:
+        return result
+    currency = next(iter(currencies), None)
+    if currency is None and currency_hint:
+        hint = normalize(str(currency_hint))
+        currency = {"usd": "USD", "$": "USD", "vnd": "VND", "₫": "VND", "d": "VND"}.get(hint)
+    period = groups["period"] or normalize(str(period_hint or ""))
+    period = {"thang": "month", "month": "month", "nam": "year", "year": "year"}.get(period)
+    result["salary_currency_orig"] = currency
+    result["salary_period_orig"] = period
+    if currency is None or period is None:
+        return result
+
+    values = []
+    for i in (1, 2):
+        number = groups[f"number{i}"]
+        if number is None:
+            continue
+        if re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{3})+", number):
+            number = number.replace(".", "")
+        value = float(number.replace(",", ""))
+        own_currency = groups[f"before{i}"] or groups[f"after{i}"]
+        if groups[f"scale{i}"] or (has_scale and own_currency not in ("vnd", "₫", "d")):
+            value *= 1_000_000
+        if currency == "USD":
+            value *= USD_TO_VND
+        if period == "year":
+            value /= 12
+        if not math.isfinite(value):
+            return result
+        values.append(value)
+
+    prefix = groups["prefix"]
+    if len(values) == 2:
+        if prefix or values[0] > values[1]:
+            return result
+        minimum, maximum = values
+        status = "closed_range"
+    elif prefix in ("tu", "from", "over", "above", "tren"):
+        minimum, maximum, status = values[0], None, "min_only"
+    elif prefix:
+        minimum, maximum, status = None, values[0], "max_only"
+    else:
+        minimum = maximum = values[0]
+        status = "closed_range"
+    result.update(Luong_Min=minimum, Luong_Max=maximum, salary_status=status)
+    return result
+
+
+def clean_row(row: dict) -> dict:
+    """Ưu tiên salary; dùng salary_detail nếu lương danh sách trống hoặc bị ẩn."""
+    raw = row.get("salary")
+    source = "salary"
+    if normalize(str(raw or "")) in HIDDEN or not str(raw or "").strip():
+        detail = row.get("salary_detail")
+        if detail is not None and str(detail).strip():
+            raw, source = detail, "salary_detail"
+    hints = {}
+    if source == "salary_detail":
+        hints = {"currency_hint": row.get("salary_detail_currency"),
+                 "period_hint": row.get("salary_detail_unit")}
+    return {**row, **parse_salary(raw, **hints), "salary_source": source}
+
+
+def main() -> None:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--in", dest="src", default="data/full.jsonl")
+    parser.add_argument("--out", default="data/salary.jsonl")
+    args = parser.parse_args()
+    source, out = Path(args.src).resolve(), Path(args.out).resolve()
+    if not source.is_file():
+        parser.error(f"Input does not exist: {source}")
+    if source == out or (out.exists() and source.samefile(out)):
+        parser.error("Input and output must be different files")
+
+    try:
+        rows = read_jsonl(source)
+        reserved = set(SALARY_COLUMNS) | {"salary_source"}
+        for index, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                parser.error(f"Row {index} must be a JSON object")
+            if reserved.intersection(row):
+                parser.error(f"Row {index} already contains normalized salary fields")
+        cleaned = [clean_row(row) for row in rows]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # write_jsonl ghi nối: dùng file tạm mới mỗi lần, rồi thay output nguyên tử.
+        with tempfile.TemporaryDirectory(dir=out.parent, prefix=".salary-") as directory:
+            temporary = Path(directory) / "salary.jsonl"
+            write_jsonl(temporary, cleaned)
+            temporary.replace(out)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    counts = Counter(row["salary_status"] for row in cleaned)
+    print(f"Wrote {len(cleaned)} rows -> {out}")
+    print(f"Fixed exercise rate: 1 USD = {USD_TO_VND} VND; annual salary / 12")
+    for status in ("closed_range", "min_only", "max_only", "negotiable", "hidden", "unknown"):
+        print(f"{status}: {counts[status]}")
+    examples = []
+    for row in cleaned:
+        raw = row.get(row["salary_source"])
+        if row["salary_status"] == "unknown" and raw not in examples:
+            examples.append(raw)
+        if len(examples) == 10:
+            break
+    if examples:
+        print("Unknown examples:")
+        for raw in examples:
+            print(repr(raw))
+
+
+if __name__ == "__main__":
+    main()

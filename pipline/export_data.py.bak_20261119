@@ -1,0 +1,237 @@
+"""Xuất hai file nộp: raw_data.csv (văn bản gốc) và clean_data.csv (đã chuẩn hóa cho EDA).
+
+Chạy từ thư mục gốc: python -m pipline.export_data
+Đầu vào (chỉ đọc, cùng thứ tự job_url):
+  data/full.jsonl         tin đúng phạm vi IT + JD chi tiết   (fetch_detail.py)
+  data/salary.jsonl       Luong_Min/Luong_Max VND/tháng         (clean_salary.py)
+  data/tech_skills.jsonl  tech / keywords theo từ điển          (extract_tech_skill_.py)
+
+Quy ước cho báo cáo:
+- Timestamp đổi sang ISO 8601 giờ Việt Nam (+07:00); giá trị gốc là thời điểm cào.
+- Ô trống = nguồn không cung cấp hoặc không suy ra được; không bao giờ điền 0.
+- List (skills, tech, keywords, cities) ghi dạng mảng JSON trong ô CSV.
+- city: thành phố xuất hiện đầu tiên trong location (tin nhiều nơi tính cho nơi đầu);
+  cities giữ đủ danh sách để EDA tách dòng nếu cần. Ngoài HN/HCM/ĐN/Remote -> "Khác".
+- seniority theo thứ tự: chức danh -> nhãn cấp bậc của nguồn -> số năm kinh nghiệm.
+  seniority_source ghi lý do, để bước phân lớp bỏ đặc trưng đã dùng tạo nhãn (tránh leakage).
+- Luong_TB chỉ tính khi có cả Luong_Min và Luong_Max (khoảng đóng hoặc lương cố định).
+"""
+
+import csv
+import hashlib
+import json
+import re
+import sys
+import tempfile
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+from crawler.base import read_jsonl
+from pipline.filter_it import normalize
+from pipline.group_jobs import assign_groups
+
+
+FULL, SALARY, SKILLS = Path("data/full.jsonl"), Path("data/salary.jsonl"), Path("data/tech_skills.jsonl")
+RAW_OUT, CLEAN_OUT = Path("raw_data.csv"), Path("clean_data.csv")
+GROUPS_OUT = Path("data/duplicate_groups.csv")  # chỉ nhóm >= 2 dòng, để kiểm tay việc ghép chéo nguồn
+GROUP_COLUMNS = ["job_group_id", "source", "company", "title", "city", "Luong_TB", "is_primary", "URL_Goc"]
+
+RAW_COLUMNS = [
+    "job_uid", "source", "URL_Goc", "Timestamp",
+    "title_raw", "company_raw", "location_raw",
+    "salary_raw", "salary_detail_raw",
+    "experience_level_raw", "experience_months_raw",
+    "role_type_raw", "work_model_raw", "employment_type_raw", "industries_raw",
+    "skills_raw", "posted_at_raw", "date_posted", "description_raw",
+]
+CLEAN_COLUMNS = [
+    "job_uid", "job_group_id", "is_primary", "source", "URL_Goc", "Timestamp",
+    "title", "company", "it_decision", "title_role",
+    "city", "cities", "work_mode",
+    "exp_min_years", "exp_max_years", "exp_source",
+    "seniority", "seniority_source",
+    "Luong_Min", "Luong_Max", "Luong_TB", "salary_status", "salary_currency_orig",
+    "salary_period_assumed",
+    "tech", "keywords", "n_tech", "n_keywords",
+    "has_jd", "jd_chars", "description",
+]
+
+CITIES = {  # tên chuẩn -> cách viết sau normalize() (không dấu, chữ thường)
+    "Hà Nội": ("ha noi", "hanoi"),
+    "TP.HCM": ("ho chi minh", "hcm", "sai gon", "saigon", "thu duc"),
+    "Đà Nẵng": ("da nang", "danang"),
+    "Remote": ("remote", "tu xa"),
+}
+CITY_RE = {name: re.compile(r"\b(?:" + "|".join(aliases) + r")\b") for name, aliases in CITIES.items()}
+
+# Xét từ cao xuống thấp: "Senior Team Lead" -> Lead. Manager/Head gộp vào Lead vì đề chỉ có 5 mức.
+# shortcut: "Junior/Middle" lấy mức cao hơn; nếu cần chính xác hơn thì xem lại bằng tay các title có 2 mức.
+LEVEL_RE = [
+    ("Lead", r"\b(?:lead|leader|truong nhom|principal|head|manager|truong phong|director|giam doc)\b"),
+    ("Senior", r"\b(?:senior|sr|cap cao)\b"),
+    ("Middle", r"\b(?:middle|mid|mid-level|intermediate)\b"),
+    ("Junior", r"\b(?:junior|jr)\b"),
+    ("Fresher", r"\b(?:fresher|intern|internship|thuc tap|thuc tap sinh|trainee|entry level|moi tot nghiep)\b"),
+]
+SOURCE_LEVEL = {  # nhãn cấp bậc VietnamWorks / TopDev
+    "intern/student": "Fresher", "fresher/entry level": "Fresher",
+    "manager": "Lead", "director and above": "Lead", "chuyen vien cap cao": "Senior",
+}
+# "3+ years of experience", "2-4 năm kinh nghiệm", "Kinh nghiệm: ít nhất 3 năm"
+YEARS = r"(\d{1,2})(?:\s*(?:-|~|to|den)\s*(\d{1,2}))?\s*\+?\s*(?:years?|yrs?|nam)\b"
+EXP_RE = [
+    re.compile(YEARS + r"[^.\n]{0,25}?(?:experience|kinh nghiem)"),
+    re.compile(r"(?:experience|kinh nghiem)[^.\n\d]{0,25}?" + YEARS),
+]
+
+
+def job_uid(row: dict) -> str:
+    return f"{row['site']}-{hashlib.sha1(row['job_url'].encode()).hexdigest()[:10]}"
+
+
+def iso_timestamp(value: str) -> str:
+    """'17/11/2026 18:29:12' (base.timestamp) -> '2026-11-17T18:29:12+07:00'."""
+    return datetime.strptime(value, "%d/%m/%Y %H:%M:%S").isoformat() + "+07:00"
+
+
+def parse_cities(location) -> list[str]:
+    text = normalize(location or "")
+    found = sorted((match.start(), name) for name, pattern in CITY_RE.items() if (match := pattern.search(text)))
+    names = [name for _, name in found]
+    return names or (["Khác"] if text else [])
+
+
+def work_mode(row: dict) -> str | None:
+    model = {"at office": "Onsite", "hybrid": "Hybrid", "remote": "Remote"}.get(normalize(row.get("work_model") or ""))
+    if model:
+        return model
+    text = normalize(f"{row.get('title') or ''} {row.get('location') or ''}")
+    return "Remote" if re.search(r"\bremote\b", text) else "Hybrid" if re.search(r"\bhybrid\b", text) else None
+
+
+def parse_experience(row: dict) -> tuple:
+    """(min năm, max năm, nguồn). Trường có cấu trúc của nguồn trước, regex JD sau."""
+    level = normalize(row.get("experience_level") or "")
+    if level == "khong yeu cau":
+        return 0, None, "field"
+    if match := re.fullmatch(r"(duoi|tren)?\s*(\d{1,2}) nam", level):  # TopCV: "2 năm", "Dưới 1 năm", "Trên 5 năm"
+        years = int(match.group(2))
+        return {"duoi": (0, years), "tren": (years, None)}.get(match.group(1), (years, years)) + ("field",)
+    if row.get("experience_months") is not None:  # ITviec JSON-LD monthsOfExperience: số tháng tối thiểu
+        return int(row["experience_months"]) // 12, None, "field"
+    jd = normalize(row.get("description") or "")
+    for pattern in EXP_RE:
+        if (match := pattern.search(jd)) and int(match.group(1)) <= 20:
+            low, high = int(match.group(1)), match.group(2) and int(match.group(2))
+            return (low, high, "jd") if high is None or high >= low else (low, None, "jd")
+    return None, None, None
+
+
+def seniority(row: dict, exp_min) -> tuple:
+    title = normalize(row.get("title") or "")
+    for level, pattern in LEVEL_RE:
+        if re.search(pattern, title):
+            return level, "title"
+    if level := SOURCE_LEVEL.get(normalize(row.get("experience_level") or "")):
+        return level, "level_field"
+    if exp_min is not None:
+        level = "Fresher" if exp_min < 1 else "Junior" if exp_min < 3 else "Middle" if exp_min < 5 else "Senior"
+        return level, "years"
+    return None, None
+
+
+def raw_record(row: dict) -> dict:
+    return {
+        "job_uid": job_uid(row), "source": row["site"], "URL_Goc": row["job_url"],
+        "Timestamp": iso_timestamp(row["Timestamp"]),
+        "title_raw": row.get("title"), "company_raw": row.get("company"), "location_raw": row.get("location"),
+        "salary_raw": row.get("salary"), "salary_detail_raw": row.get("salary_detail"),
+        "experience_level_raw": row.get("experience_level"), "experience_months_raw": row.get("experience_months"),
+        "role_type_raw": row.get("role_type"), "work_model_raw": row.get("work_model"),
+        "employment_type_raw": row.get("employment_type"), "industries_raw": row.get("industries"),
+        "skills_raw": row.get("skills"), "posted_at_raw": row.get("posted_at"),
+        "date_posted": row.get("date_posted"), "description_raw": row.get("description"),
+    }
+
+
+def clean_record(row: dict, salary: dict, skills: dict) -> dict:
+    cities = parse_cities(row.get("location"))
+    exp_min, exp_max, exp_source = parse_experience(row)
+    level, level_source = seniority(row, exp_min)
+    low, high = salary["Luong_Min"], salary["Luong_Max"]
+    description = " ".join((row.get("description") or "").split())
+    return {
+        "job_uid": job_uid(row), "source": row["site"], "URL_Goc": row["job_url"],
+        "Timestamp": iso_timestamp(row["Timestamp"]),
+        "title": " ".join((row.get("title") or "").split()), "company": " ".join((row.get("company") or "").split()),
+        "it_decision": row.get("it_decision"), "title_role": row.get("title_role"),
+        "city": cities[0] if cities else None, "cities": cities, "work_mode": work_mode(row),
+        "exp_min_years": exp_min, "exp_max_years": exp_max, "exp_source": exp_source,
+        "seniority": level, "seniority_source": level_source,
+        "Luong_Min": low, "Luong_Max": high,
+        "Luong_TB": (low + high) / 2 if low is not None and high is not None else None,
+        "salary_status": salary["salary_status"], "salary_currency_orig": salary["salary_currency_orig"],
+        "salary_period_assumed": salary["salary_period_assumed"],
+        "tech": skills["tech"], "keywords": skills["keywords"],
+        "n_tech": len(skills["tech"]), "n_keywords": len(skills["keywords"]),
+        "has_jd": bool(description), "jd_chars": len(description), "description": description,
+    }
+
+
+def cell(value):
+    """None -> ô trống, list -> mảng JSON, lương float tròn -> số nguyên VND."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, float):
+        return round(value)
+    return value
+
+
+def write_csv(path: Path, columns: list[str], records: list[dict]) -> None:
+    # utf-8-sig để Excel mở đúng tiếng Việt; ghi file tạm rồi thay để Ctrl+C không làm hỏng file cũ.
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8-sig", newline="", dir=path.parent or ".",
+                                     prefix=f".{path.stem}-", suffix=".csv", delete=False) as fh:
+        writer = csv.DictWriter(fh, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows({key: cell(record[key]) for key in columns} for record in records)
+    Path(fh.name).replace(path)
+
+
+def main() -> None:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    for path in (FULL, SALARY, SKILLS):
+        if not path.is_file():
+            sys.exit(f"Thiếu {path}. Chạy lần lượt fetch_detail, clean_salary, extract_tech_skill_ trước.")
+    rows, salaries, skills = read_jsonl(FULL), read_jsonl(SALARY), read_jsonl(SKILLS)
+    urls = [row.get("job_url") for row in rows]
+    if urls != [r.get("job_url") for r in salaries] or urls != [r.get("job_url") for r in skills]:
+        sys.exit("salary.jsonl / tech_skills.jsonl không khớp full.jsonl: chạy lại clean_salary và extract_tech_skill_.")
+    if len(set(urls)) != len(urls):
+        sys.exit("full.jsonl có job_url trùng: chạy lại duplicate.py.")
+    missing = [i for i, row in enumerate(rows, 1) if not row.get("job_url") or not row.get("Timestamp")]
+    if missing:
+        sys.exit(f"{len(missing)} dòng thiếu URL_Goc/Timestamp (đề bắt buộc), ví dụ dòng {missing[:5]}")
+
+    raw = [raw_record(row) for row in rows]
+    clean = assign_groups([clean_record(row, s, k) for row, s, k in zip(rows, salaries, skills)])
+    sizes = Counter(r["job_group_id"] for r in clean)
+    grouped = sorted((r for r in clean if sizes[r["job_group_id"]] > 1), key=lambda r: (r["job_group_id"], r["source"]))
+    write_csv(RAW_OUT, RAW_COLUMNS, raw)
+    write_csv(CLEAN_OUT, CLEAN_COLUMNS, clean)
+    write_csv(GROUPS_OUT, GROUP_COLUMNS, grouped)
+
+    print(f"Wrote {len(raw)} rows -> {RAW_OUT}, {CLEAN_OUT}")
+    print("source:", dict(Counter(r["source"] for r in clean)))
+    for column in ("city", "work_mode", "seniority", "seniority_source", "exp_source", "salary_status"):
+        print(f"{column}:", dict(Counter(r[column] for r in clean).most_common()))
+    print("has Luong_TB:", sum(r["Luong_TB"] is not None for r in clean),
+          "| has JD:", sum(r["has_jd"] for r in clean), "| has tech:", sum(r["n_tech"] > 0 for r in clean))
+    print(f"cross-source groups: {sum(n > 1 for n in sizes.values())} ({len(grouped)} rows) -> {GROUPS_OUT}",
+          "| is_primary:", sum(r["is_primary"] for r in clean))
+
+
+if __name__ == "__main__":
+    main()

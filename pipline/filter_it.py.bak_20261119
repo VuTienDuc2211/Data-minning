@@ -1,0 +1,213 @@
+"""Lọc tin IT / không IT bằng title, role_type và tag; không đọc JD, không dùng LLM.
+
+Chạy từ thư mục gốc: python -m pipline.filter_it
+data/dedup.jsonl -> data/it.jsonl (keep + ambiguous), data/non_it.jsonl (drop).
+Phạm vi: mọi vị trí IT (dev, QA/tester, DevOps, data/AI, BA/PM IT, bảo mật, nhúng...).
+Loại: chức năng không phải IT (sales, marketing, nhân sự) và lập trình máy CNC/PLC.
+"""
+
+import argparse
+import json
+import re
+import sys
+import tempfile
+import unicodedata
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from crawler.base import read_jsonl, write_jsonl
+
+
+DICTIONARY = Path(__file__).resolve().parents[1] / "data/skill_dictionary.json"
+DEV_WORD = r"\b(?:developers?|engineers?|programmers?|dev|lap trinh vien|ky su)\b"
+# shortcut: luật thủ công theo mẫu dữ liệu đã cào; thêm nguồn mới thì xem lại data/non_it.jsonl và bổ sung.
+# role_of xét theo thứ tự: chức năng không IT -> lập trình máy -> vai trò IT -> chức danh chung.
+NON_IT_FUNCTION = r"\b(?:(?:tele ?)?sales?|pre[ -]?sales?|presales?|kinh doanh|ban hang|account (?:manager|executive)|marketing|business development|phat trien thi truong|talent acquisition|recruiters?|recruitment|human resources|hr|tuyen dung|nhan su|ke toan|accountants?)\b"
+MACHINE_PROGRAMMING = r"\blap trinh (?:vien )?(?:cnc|plc|may|khuon|robot|phay|tien|gia cong)\b|\b(?:cnc|plc|cad/cam|mastercam)\b"
+IT_ROLES = (
+    ("backend", r"\bback[ -]?end\b"),
+    ("frontend", r"\bfront[ -]?end\b"),
+    ("fullstack", r"\bfull[ -]?stack\b"),
+    ("mobile", r"\b(?:mobile|android|ios|flutter|react native)\b"),
+    ("software", r"\b(?:software|phan mem|web(?:site)?|lap trinh(?: vien)?|programmers?|tech(?:nical)? ?lead\w*|cto|chief (?:technology|information) officer|phat trien (?:app|ung dung))\b"),
+    ("qa_test", r"\b(?:testers?|testing|kiem thu|sdet|test (?:engineers?|automation|analysts?|lead\w*)|automation (?:test\w*|qa)|qa (?:engineers?|automation))\b"),
+    ("devops_cloud", r"\b(?:devops|devsecops|sre|site reliability|cloud|kubernetes|platform engineers?)\b"),
+    ("system_network", r"\b(?:system admin\w*|sysadmin|sysops|network (?:engineers?|admin\w*)|quan tri (?:he thong|mang)|he thong mang|ky thuat (?:mang|vien may tinh|may tinh)|van hanh he thong|noc|may chu|it support|helpdesk|help desk|tich hop he thong|system integration)\b"),
+    ("data_ai", r"\b(?:data (?:engineer|analy|scien|architect|pipeline|platform|governance|warehouse)\w*|big data|co so du lieu|quan tri du lieu|database|dba|machine learning|deep learning|ml engineers?|ai engineers?|genai|llm|power bi|business intelligence|analytics engineers?|phan tich du lieu|ky su du lieu)\b"),
+    ("security", r"\b(?:cyber ?security|an ninh (?:mang|thong tin)|an toan thong tin|attt|bao mat (?:thong tin|he thong)|information security|application security|security (?:engineers?|analysts?|specialists?)|pentest\w*|penetration)\b"),
+    ("embedded", r"\b(?:embedded|firmware|fpga|iot)\b|\b(?:lap trinh|ky su|phan mem) nhung\b"),
+    ("it_general", r"\b(?:cntt|cong nghe thong tin|information technology|erp|odoo|salesforce|servicenow|outsystems?|blockchain|unity|unreal|ui ?/ ?ux|ux ?/ ?ui|(?:solution|software|technical) architects?)\b"),
+)
+# Viết tắt trùng chữ tiếng Việt khi bỏ dấu (Ba Vì, thiết bị, sắp xếp) nên khớp trên title gốc, phân biệt hoa/thường.
+IT_ACRONYM = r"\b(?:IT|AI|ML|BI|SAP)\b"
+GENERIC = r"\b(?:developers?|engineers?|ky su|analysts?|phan tich nghiep vu|product (?:owner|manager)|project manager|scrum master|automation|architects?)\b"
+GENERIC_ACRONYM = r"\b(?:QA|QC|BA|PM)\b"
+IT_ROLE_NAMES = {name for name, _ in IT_ROLES}
+
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text.casefold().replace("đ", "d"))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    # "_" thuộc \w nên phải đổi thành dấu cách, nếu không "Devops_SRE" không khớp "devops".
+    return " ".join(re.sub(r"[–—−]", "-", text).replace("_", " ").split())
+
+
+def load_dictionary(path=DICTIONARY, groups=("tech",)) -> tuple[dict, re.Pattern]:
+    """alias -> (tên chuẩn, category, group) và một regex alias dài trước alias ngắn.
+
+    Bộ lọc chỉ nạp nhóm tech; extract_tech_skill_ nạp cả tech lẫn keywords.
+    """
+    entries = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(entries, list):
+        raise ValueError("Skill dictionary must be a list")
+    aliases = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("group") not in ("tech", "keywords"):
+            raise ValueError("Each skill needs a tech/keywords group")
+        name, variants = entry.get("name"), entry.get("aliases", [])
+        if not isinstance(name, str) or not name.strip() or not isinstance(variants, list):
+            raise ValueError("Each skill needs a name and an aliases list")
+        for alias in [name, *variants]:
+            if not isinstance(alias, str) or not alias.strip():
+                raise ValueError("Skill aliases must be non-empty strings")
+            if entry["group"] in groups:
+                key = normalize(alias)
+                if key in aliases and aliases[key][0] != name:
+                    raise ValueError(f"Duplicate skill alias: {alias}")
+                aliases[key] = (name, entry.get("category"), entry["group"])
+    if not aliases:
+        raise ValueError(f"Skill dictionary has no {'/'.join(groups)} skills")
+    pattern = re.compile(r"(?<![\w+#])(?:" + "|".join(
+        re.escape(alias) for alias in sorted(aliases, key=len, reverse=True)
+    ) + r")(?![\w+#])")
+    return aliases, pattern
+
+
+def match_skills(text: str, dictionary: tuple, *, title=False) -> dict:
+    """Tên chuẩn -> nhóm con. C/R/Go chỉ nhận tag nguyên vẹn hoặc sát tên vai trò."""
+    aliases, pattern = dictionary
+    text = normalize(text)
+    found = {}
+    for match in pattern.finditer(text):
+        alias = match.group()
+        if alias in ("c", "r", "go") and text != alias:
+            if not title or not re.search(
+                rf"(?:{re.escape(alias)}\s+{DEV_WORD}|{DEV_WORD}\s+{re.escape(alias)})(?![\w+#])", text
+            ):
+                continue
+        name, category, _ = aliases[alias]
+        found[name] = category
+    return found
+
+
+def role_of(title: str, dictionary: tuple) -> str:
+    text = normalize(title)
+    if re.search(NON_IT_FUNCTION, text):
+        return "non_it_function"
+    if re.search(MACHINE_PROGRAMMING, text):
+        return "machine_programming"
+    for role, pattern in IT_ROLES:
+        if re.search(pattern, text):
+            return role
+    if re.search(IT_ACRONYM, title):
+        return "it_general"
+    if re.search(DEV_WORD, text) and any(
+        category in ("language", "framework") for category in match_skills(title, dictionary, title=True).values()
+    ):
+        return "software"  # "Java Developer", "Go Engineer"
+    if re.search(GENERIC, text) or re.search(GENERIC_ACRONYM, title):
+        return "generic"
+    return "unknown"
+
+
+def classify_row(row: dict, dictionary: tuple) -> dict:
+    """Tầng 1 lấy tín hiệu (vai trò trong title, số tag tech); tầng 2 chỉ loại khi chắc chắn không phải IT."""
+    title, tags = row.get("title") or "", row.get("skills") or []
+    if not isinstance(title, str) or not isinstance(row.get("role_type") or "", str):
+        raise ValueError("title and role_type must be strings or null")
+    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+        raise ValueError("skills must be a list of strings or null")
+    skill_hits = sum(bool(match_skills(tag, dictionary)) for tag in {normalize(tag) for tag in tags if tag.strip()})
+    role = role_of(title, dictionary)
+    if role in ("generic", "unknown"):
+        fallback = role_of(row.get("role_type") or "", dictionary)  # role_type chỉ ITviec có
+        if fallback != "unknown":
+            role = fallback
+
+    if role == "non_it_function":
+        decision, reason = "drop", "Chức năng không phải IT (sales/marketing/nhân sự)"
+    elif role == "machine_programming":
+        decision, reason = "drop", "Lập trình máy CNC/PLC, không phải IT"
+    elif role in IT_ROLE_NAMES:
+        decision, reason = "keep", "Chức danh IT"
+    elif role == "generic" and skill_hits:
+        decision, reason = "keep", "Chức danh chung có tag tech"
+    elif role == "generic" or skill_hits:
+        decision, reason = "ambiguous", "Chức danh chung hoặc chỉ có tag tech, cần kiểm tra JD"
+    elif row.get("site") == "itviec":
+        decision, reason = "ambiguous", "ITviec chỉ đăng việc IT nhưng title chưa rõ"
+    else:
+        decision, reason = "drop", "Không có tín hiệu IT trong title hoặc tag"
+    return {**row, "it_decision": decision, "it_reason": reason,
+            "title_role": role, "skill_hits": skill_hits}
+
+def main() -> None:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--in", dest="src", default="data/dedup.jsonl")
+    parser.add_argument("--out", default="data/it.jsonl")
+    parser.add_argument("--non-it", default="data/non_it.jsonl")
+    parser.add_argument("--dictionary", type=Path, default=DICTIONARY)
+    args = parser.parse_args()
+    source, kept_path, dropped_path, dictionary_path = (
+        Path(path).resolve() for path in (args.src, args.out, args.non_it, args.dictionary)
+    )
+    if not source.is_file():
+        parser.error(f"Input does not exist: {source}. Run python -m pipline.duplicate first.")
+    paths = [source, kept_path, dropped_path, dictionary_path]
+    for index, path in enumerate(paths):
+        for other in paths[:index]:
+            if path == other or (path.exists() and other.exists() and path.samefile(other)):
+                parser.error("Input, outputs and dictionary must be different files")
+    try:
+        dictionary = load_dictionary(dictionary_path)
+        kept, dropped = [], []
+        counts = defaultdict(Counter)
+        for index, row in enumerate(read_jsonl(source), 1):
+            if not isinstance(row, dict):
+                raise ValueError(f"Row {index} must be a JSON object")
+            result = classify_row(row, dictionary)
+            counts[str(row.get("site") or "unknown")][result["it_decision"]] += 1
+            (dropped if result["it_decision"] == "drop" else kept).append(result)
+        # write_jsonl ghi nối: chuẩn bị hai file tạm mới trước khi thay output.
+        staged = []
+        try:
+            for target, rows in ((kept_path, kept), (dropped_path, dropped)):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # Cùng thư mục output: replace cùng ổ đĩa, giữ quyền truy cập kế thừa.
+                with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".filter-it-", delete=False) as handle:
+                    temporary = Path(handle.name)
+                staged.append((temporary, target))
+                write_jsonl(temporary, rows)
+            for temporary, target in staged:
+                temporary.replace(target)
+        finally:
+            for temporary, _ in staged:
+                temporary.unlink(missing_ok=True)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    print(f"{'site':<18} {'keep':>7} {'ambiguous':>10} {'drop':>7} {'total':>7}")
+    total = Counter()
+    for site, count in sorted(counts.items()):
+        print(f"{site:<18} {count['keep']:>7} {count['ambiguous']:>10} {count['drop']:>7} {sum(count.values()):>7}")
+        total.update(count)
+    print(f"{'TOTAL':<18} {total['keep']:>7} {total['ambiguous']:>10} {total['drop']:>7} {sum(total.values()):>7}")
+    print(f"Kept {len(kept)} candidates (including ambiguous) -> {kept_path}")
+    print(f"Dropped {len(dropped)} rows -> {dropped_path}")
+    if total["keep"] < 800:
+        print("Fewer than 800 keep rows; review ambiguous rows and crawl more dev listings if needed.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,103 @@
+"""Trích tech skill / keyword từ title, tag và JD chi tiết theo từ điển, không dùng LLM.
+
+Chạy từ thư mục gốc: python -m pipline.extract_tech_skill_
+data/full.jsonl (chỉ đọc) -> data/tech_skills.jsonl, mỗi tin một dòng:
+{"job_url": "...", "title": "...", "tech": ["..."], "keywords": ["..."]}
+job_url là khóa để ghép với lương / raw_data.csv. Tên kỹ năng luôn là tên chuẩn trong
+data/skill_dictionary.json (group "tech" hay "keywords"), mỗi tên chỉ xuất hiện một lần trong một tin.
+"""
+
+import argparse
+import re
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+from crawler.base import read_jsonl, write_jsonl
+from pipline.filter_it import DICTIONARY, load_dictionary, match_skills, normalize
+
+
+# shortcut: luật thủ công theo mẫu JD đã cào; nếu thấy bắt nhầm thì xem lại các tin trong data/tech_skills.jsonl rồi bổ sung.
+# Các tên dễ trùng với chữ thường ("Công", "R&D", "go-live", "express themselves") chỉ được nhận
+# khi đứng cạnh một skill khác trong danh sách, ví dụ "C/C++", "Java, Go, Python".
+# Phải có dấu phân cách thật: chỉ một dấu cách thì "SAP R/3" sẽ bị đếm thành R.
+LIST_ONLY = {"c", "r", "go", "express"}
+LIST_GAP = re.compile(r"[\s()]*(?:(?:[,;/|&+]|and|or|va|hoac)[\s()]*)+")
+# Các tên trùng với từ khác sau khi đã hạ chữ thường ("Ai yêu...", "sắp xếp", "solid understanding")
+# chỉ được nhận khi văn bản gốc viết hoa.
+UPPER_ONLY = {"ai": "AI", "sap": "SAP", "solid": "SOLID"}
+
+
+def skills_in_jd(text: str, dictionary: tuple) -> set[str]:
+    aliases, pattern = dictionary
+    normalized = normalize(text)
+    hits = list(pattern.finditer(normalized))
+    found = set()
+    for index, hit in enumerate(hits):
+        alias = hit.group()
+        if alias in LIST_ONLY:
+            before = index > 0 and LIST_GAP.fullmatch(normalized[hits[index - 1].end():hit.start()])
+            after = index + 1 < len(hits) and LIST_GAP.fullmatch(normalized[hit.end():hits[index + 1].start()])
+            if not (before or after):
+                continue
+        if alias in UPPER_ONLY and not re.search(rf"(?<![\w+#]){UPPER_ONLY[alias]}(?![\w+#])", text):
+            continue
+        found.add(aliases[alias][0])
+    return found
+
+
+def extract_row(row: dict, dictionary: tuple) -> dict:
+    """Gộp skill từ title, từng tag và JD; chia theo group của từ điển."""
+    title = row.get("title") or ""
+    names = set(match_skills(title, dictionary, title=True))
+    for tag in row.get("skills") or []:
+        names.update(match_skills(tag, dictionary))
+    names.update(skills_in_jd(row.get("description") or "", dictionary))
+    group_of = {name: group for name, _, group in dictionary[0].values()}
+    return {
+        "job_url": row.get("job_url"),
+        "title": title,
+        "tech": sorted((name for name in names if group_of[name] == "tech"), key=str.casefold),
+        "keywords": sorted((name for name in names if group_of[name] == "keywords"), key=str.casefold),
+    }
+
+
+def main() -> None:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--in", dest="src", default="data/full.jsonl")
+    parser.add_argument("--out", default="data/tech_skills.jsonl")
+    parser.add_argument("--dictionary", type=Path, default=DICTIONARY)
+    args = parser.parse_args()
+    source, target = Path(args.src).resolve(), Path(args.out).resolve()
+    if not source.is_file():
+        parser.error(f"Input does not exist: {source}. Run python -m pipline.fetch_detail first.")
+    if source == target:
+        parser.error("--in and --out must be different files")
+    try:
+        dictionary = load_dictionary(args.dictionary, groups=("tech", "keywords"))
+        rows = [extract_row(row, dictionary) for row in read_jsonl(source)]
+        # write_jsonl ghi nối: ghi ra file tạm mới rồi thay file cũ, chạy lại không bị nhân đôi dòng.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".tech-skills-", delete=False) as handle:
+            temporary = Path(handle.name)
+        try:
+            write_jsonl(temporary, rows)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    tech_counts = Counter(name for row in rows for name in row["tech"])
+    keyword_counts = Counter(name for row in rows for name in row["keywords"])
+    print(f"{len(rows)} tin -> {target}")
+    print(f"Tin có ít nhất 1 tech: {sum(bool(row['tech']) for row in rows)}; không có tech lẫn keyword: "
+          f"{sum(not row['tech'] and not row['keywords'] for row in rows)}")
+    print("Top 15 tech:", ", ".join(f"{name} {count}" for name, count in tech_counts.most_common(15)))
+    print("Top 10 keyword:", ", ".join(f"{name} {count}" for name, count in keyword_counts.most_common(10)))
+
+
+if __name__ == "__main__":
+    main()
